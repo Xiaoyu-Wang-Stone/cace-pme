@@ -3,10 +3,12 @@ import torch.nn as nn
 from itertools import product
 from typing import Dict
 import numpy as np
+import torchpme
+from vesin.torch import NeighborList
 
 class EwaldPotential(nn.Module):
     def __init__(self,
-                 dl=2.0,  # grid resolution
+                 dl=0.5,  # grid resolution
                  sigma=1.0,  # width of the Gaussian on each atom
                  exponent=1, # default is for electrostattics with p=1, we can do London dispersion with p=6
                  external_field = None, # external field
@@ -17,8 +19,14 @@ class EwaldPotential(nn.Module):
                  output_key: str = 'ewald_potential',
                  aggregation_mode: str = "sum",
                  compute_field: bool = False,
+                 use_pme=True,  # Whether to use torch-pme  
+                 cutoff=5.5, # cutoff for PME to generate the neighbor list
                  ):
         super().__init__()
+        # Initialize torch-pme calculator
+        self.use_pme = use_pme
+        self.cutoff = cutoff
+
         self.dl = dl
         self.sigma = sigma
         self.exponent = exponent
@@ -47,6 +55,14 @@ class EwaldPotential(nn.Module):
         self.required_derivatives = []
         self.required_derivatives.append('cell')
 
+        # Setup torch-pme calculator
+        self.potential = torchpme.CoulombPotential(smearing=sigma)
+        self.calculator = torchpme.EwaldCalculator(
+            potential=self.potential,
+            lr_wavelength=dl,
+            prefactor=torchpme.prefactors.eV_A
+        )
+
     def forward(self, data: Dict[str, torch.Tensor], **kwargs):
         if data["batch"] is None:
             n_nodes = data['positions'].shape[0]
@@ -55,10 +71,14 @@ class EwaldPotential(nn.Module):
             batch_now = data["batch"]
 
         # this is just for compatibility with the previous version
-        if hasattr(self, 'exponent') == False:
+        if not hasattr(self, 'exponent'):
             self.exponent = 1
-        if hasattr(self, 'compute_field') == False:
+        if not hasattr(self, 'compute_field'):
             self.compute_field = False
+        
+        # this should be updated 
+        self.use_pme = getattr(self, 'use_pme', True)
+        self.cutoff = getattr(self, 'cutoff', 5.5) # this is hardcoded for now
         
         # box = data['cell'].view(-1, 3, 3).diagonal(dim1=-2, dim2=-1)
         box = data['cell'].view(-1, 3, 3)
@@ -76,19 +96,40 @@ class EwaldPotential(nn.Module):
 
         results = []
         field_results = []
-        for i in unique_batches:
-            mask = batch_now == i  # Create a mask for the i-th configuration
-            # Calculate the potential energy for the i-th configuration
-            r_raw_now, q_now, box_now = r[mask], q[mask], box[i]
-            box_diag = box[i].diagonal(dim1=-2, dim2=-1)
-            if box_diag[0] < 1e-6 and box_diag[1] < 1e-6 and box_diag[2] < 1e-6 and self.exponent == 1:
-                # the box is not periodic, we use the direct sum
-                pot, field = self.compute_potential_realspace(r_raw_now, q_now, self.compute_field)
-            elif box_diag[0] > 0 and box_diag[1] > 0 and box_diag[2] > 0:
-                # the box is periodic, we use the reciprocal sum
-                pot, field = self.compute_potential_triclinic(r_raw_now, q_now, box_now, self.compute_field)
-            else:
-                raise ValueError("Either all box dimensions must be positive or aperiodic box must be provided.")
+                
+        for i in unique_batches:  
+            mask = batch_now == i  
+            r_raw_now, q_now, box_now = r[mask], q[mask], box[i]  
+            #pot, field_original = self.compute_potential_optimized(r_raw_now, q_now, box_now, self.compute_field)
+            pot, field = self.compute_potential_pme(r_raw_now, q_now, box_now, self.compute_field)
+            
+            box_diag = box[i].diagonal(dim1=-2, dim2=-1)  
+
+            if self.use_pme and box_diag[0] > 0 and box_diag[1] > 0 and box_diag[2] > 0:  
+                # Use torch-pme for periodic systems  
+                try:
+                    pot_pme, field__pme = self.compute_potential_pme(r_raw_now, q_now, box_now, self.compute_field)
+                    field = None
+                    if self.compute_field:
+                        forces = -torch.autograd.grad(pot, r_raw_now)[0]
+                        field = -forces / q_now
+                        
+                except Exception as e:
+                    print(f"PME calculation failed, falling back to standard Ewald: {str(e)}")
+                    if box_diag[0] < 1e-6 and box_diag[1] < 1e-6 and box_diag[2] < 1e-6 and self.exponent == 1:  
+                        pot, field = self.compute_potential_realspace(r_raw_now, q_now, self.compute_field)  
+                    elif box_diag[0] > 0 and box_diag[1] > 0 and box_diag[2] > 0:  
+                        pot, field = self.compute_potential_triclinic(r_raw_now, q_now, box_now, self.compute_field)  
+                    else:  
+                        raise ValueError("Either all box dimensions must be positive or aperiodic box must be provided.")
+            else:  
+                # Use existing Ewald summation for non-periodic systems
+                if box_diag[0] < 1e-6 and box_diag[1] < 1e-6 and box_diag[2] < 1e-6 and self.exponent == 1:  
+                    pot, field = self.compute_potential_realspace(r_raw_now, q_now, self.compute_field)  
+                elif box_diag[0] > 0 and box_diag[1] > 0 and box_diag[2] > 0:  
+                    pot, field = self.compute_potential_triclinic(r_raw_now, q_now, box_now, self.compute_field)  
+                else:  
+                    raise ValueError("Either all box dimensions must be positive or aperiodic box must be provided.")        
 
             if self.exponent == 1 and hasattr(self, 'external_field') and self.external_field is not None:
                 # if self.external_field_direction is an integer, then external_field_direction is the direction index
@@ -248,12 +289,24 @@ class EwaldPotential(nn.Module):
         dtype = torch.complex64 if r_raw.dtype == torch.float32 else torch.complex128
         device = r_raw.device
 
-        volume = box[0] * box[1] * box[2]
-        r = r_raw / box
+        # Ensure box is in the correct format
+        if box.dim() == 1:
+            box = box.view(1, 3)  # Reshape to [1, 3] for broadcasting
+        elif box.dim() == 2:
+            if box.shape[0] == 3 and box.shape[1] == 3:
+                # If box is a 3x3 matrix, get its diagonal
+                box = box.diagonal(dim1=-2, dim2=-1).view(1, 3)
+        
+        # Get box dimensions
+        box_dims = box[0]  # [3]
+        volume = box_dims[0] * box_dims[1] * box_dims[2]
+        
+        # Use broadcasting for division
+        r = r_raw / box_dims  # This will now work with broadcasting
 
         q_field = torch.zeros_like(q, dtype=r_raw.dtype, device=device) # Field due to q
 
-        nk = (box / self.dl).int().tolist()
+        nk = (box_dims / self.dl).int().tolist()
         nk = [max(1, k) for k in nk]
 
         n = r.shape[0]
@@ -282,9 +335,9 @@ class EwaldPotential(nn.Module):
         ky = torch.arange(-nk[1], nk[1] + 1, device=device)
         kz = torch.arange(-nk[2], nk[2] + 1, device=device)
 
-        kx_term = (kx / box[0]) ** 2
-        ky_term = (ky / box[1]) ** 2
-        kz_term = (kz / box[2]) ** 2
+        kx_term = (kx / box_dims[0]) ** 2
+        ky_term = (ky / box_dims[1]) ** 2
+        kz_term = (kz / box_dims[2]) ** 2
 
         kx_sq = kx_term.view(-1, 1, 1)
         ky_sq = ky_term.view(1, -1, 1)
@@ -301,7 +354,6 @@ class EwaldPotential(nn.Module):
 
             # Compute kfac based on the provided expression
             kfac = -1.0 * k_sq ** (3 / 2) * ( torch.pi ** 0.5 * torch.special.erfc(b) + (1 / (2 * b ** 3) - 1 / b) * torch.exp(-b_sq))
-            #kfac = -1.0 * k_sq ** (3 / 2) * torch.exp(-b_sq) # this assumed a Gaussian smearing
 
         mask = (k_sq <= self.k_sq_max) & (k_sq > 0)
         kfac[~mask] = 0
@@ -320,17 +372,14 @@ class EwaldPotential(nn.Module):
             q_expanded = q.unsqueeze(2).unsqueeze(3).unsqueeze(4)
         else:
             raise ValueError("q must be 1D or 2D tensor")
-        # q_expanded: [n_node, n_q, 1, 1, 1]
-        # eik: [n_node, n_x, n_y, n_z]
-        # sk: [n_q, n_x, n_y, n_z]
-        # kfac: [n_x, n_y, n_z]
+
         eik = eikx_expanded * eiky_expanded * eikz_expanded
         sk = torch.sum(q_expanded * eik.unsqueeze(1), dim=[0])
         sk_conj = torch.conj(sk)
         pot = (kfac.unsqueeze(0) * factor.view(1, -1, 1, 1) * torch.real(sk_conj * sk)).sum(dim=[1, 2, 3])
-        # The reverse transform to get the real-space potential field
+        
         if compute_field:
-            sk_field = 2. * kfac.unsqueeze(0) * sk_conj  # the factor of 2 comes from normalization factor 2\epsilon
+            sk_field = 2. * kfac.unsqueeze(0) * sk_conj
             q_field = (factor.view(1, 1, -1, 1, 1) * torch.real(eik.unsqueeze(1) * sk_field.unsqueeze(0))).sum(dim=[2, 3, 4])
             q_field /= volume
 
@@ -427,3 +476,92 @@ class EwaldPotential(nn.Module):
             q_field -= q * (2 / (self.sigma * (2 * torch.pi)**1.5))
 
         return pot.unsqueeze(0) * self.norm_factor, q_field.unsqueeze(1) * self.norm_factor
+
+
+    def setup_ewald_calculator(self, device='cpu', dtype=torch.float32):
+        """配置Ewald参数，模拟原始CACE库的dl=0.5设置"""
+        smearing = 1.0  # 根据盒尺寸调整smearing参数
+
+        lr_wavelength = 0.5 #2.0 * smearing  # 长程波长参数    
+
+        # 创建库仑势计算器
+        potential = torchpme.CoulombPotential(smearing)
+        calculator = torchpme.EwaldCalculator(
+            potential=potential,
+            lr_wavelength=lr_wavelength,
+            prefactor = torchpme.prefactors.eV_A
+        )
+        return calculator.to(device=device, dtype=dtype)
+
+
+    def compute_potential_pme(self, r_raw, q, box, compute_field=False):
+        """Compute potential energy using torchpme for periodic systems.
+        
+        Args:
+            r_raw (torch.Tensor): Atomic positions [n_atoms, 3]
+            q (torch.Tensor): Atomic charges [n_atoms, 1]
+            box (torch.Tensor): Simulation box [3] or [3, 3]
+            compute_field (bool): Whether to compute electric field
+            
+        Returns:
+            tuple: (potential energy, electric field if compute_field=True else None)
+        """
+        device = r_raw.device
+        dtype = r_raw.dtype
+        
+        # Get box diagonal for PME
+
+        # Handle different box input formats
+        if box.dim() == 1:
+            # Convert 1D box to 3x3 matrix
+            box_diag = box
+            box = torch.diag(box)
+        elif box.dim() == 2:
+            if box.shape[0] == 3 and box.shape[1] == 3:
+                box_diag = box.diagonal(dim1=-2, dim2=-1)
+            else:
+                box_diag = box
+                box = torch.diag(box)
+        else:
+            raise ValueError(f"Invalid box dimensions: {box.shape}")
+                
+        # Compute neighbor list, we don't need it for the short range part
+        #nl = NeighborList(cutoff=self.cutoff, full_list=False)
+        #neighbor_indices, neighbor_distances = nl.compute(   
+        #    points=r_raw, box=box_diag, periodic=True, quantities="Pd"
+        #)
+        
+        # Setup PME calculator
+        self.calculator = self.setup_ewald_calculator(device=device, dtype=dtype)
+
+        
+        try:
+            # Calculate potentials using torchpme
+            potentials = self.calculator(
+                charges=q,  # q is already (N,1)
+                cell=box,  # Use box diagonal
+                positions=r_raw,
+                neighbor_indices=torch.zeros((0, 2), dtype=torch.int32, device=device), # neighbor_indices is not used in PME
+                neighbor_distances=torch.zeros(0, dtype=dtype, device=device) # neighbor_distances is not used in PME
+            )
+            
+            # Calculate energy
+            pot = (q.squeeze() * potentials.squeeze()).sum().unsqueeze(0) / (torchpme.prefactors.eV_A * 2.0 * torch.pi)
+            
+            # Calculate field if requested
+            field = None
+            if compute_field:
+                forces = -torch.autograd.grad(pot, r_raw)[0]
+                field = -forces / q
+                
+            return pot, field
+            
+        except Exception as e:
+            print(f"PME calculation failed: {str(e)}")
+            # Fall back to standard Ewald summation
+            if torch.all(box < 1e-6) and self.exponent == 1:
+                return self.compute_potential_realspace(r_raw, q, compute_field)
+            elif torch.all(box > 0):
+                return self.compute_potential_triclinic(r_raw, q, box, self.compute_field) 
+            else:
+                raise ValueError("Either all box dimensions must be positive or aperiodic box must be provided.")
