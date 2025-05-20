@@ -13,7 +13,9 @@ The Cartesian Atomic Cluster Expansion (CACE) is a new approach for developing m
 - matscipy
 
 ## Installation
-
+'''python
+conda install --name CACE numpy "ase<=3.22.1" torch matscipy
+'''
 Please refer to the `setup.py` file for installation instructions.
 
 ## Usage
