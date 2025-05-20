@@ -100,6 +100,8 @@ class EwaldPotential(nn.Module):
         for i in unique_batches:  
             mask = batch_now == i  
             r_raw_now, q_now, box_now = r[mask], q[mask], box[i]  
+
+            # original version 
             #pot, field_original = self.compute_potential_optimized(r_raw_now, q_now, box_now, self.compute_field)
             
             
@@ -109,7 +111,7 @@ class EwaldPotential(nn.Module):
                 # Use torch-pme for periodic systems  
                 try:
                     pot, field = self.compute_potential_pme(r_raw_now, q_now, box_now, self.compute_field)
-                    pot_pme, field__pme = self.compute_potential_pme(r_raw_now, q_now, box_now, self.compute_field)
+                    #pot_pme, field__pme = self.compute_potential_pme(r_raw_now, q_now, box_now, self.compute_field)
                     field = None
                     if self.compute_field:
                         forces = -torch.autograd.grad(pot, r_raw_now)[0]
