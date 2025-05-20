@@ -101,13 +101,14 @@ class EwaldPotential(nn.Module):
             mask = batch_now == i  
             r_raw_now, q_now, box_now = r[mask], q[mask], box[i]  
             #pot, field_original = self.compute_potential_optimized(r_raw_now, q_now, box_now, self.compute_field)
-            pot, field = self.compute_potential_pme(r_raw_now, q_now, box_now, self.compute_field)
+            
             
             box_diag = box[i].diagonal(dim1=-2, dim2=-1)  
 
             if self.use_pme and box_diag[0] > 0 and box_diag[1] > 0 and box_diag[2] > 0:  
                 # Use torch-pme for periodic systems  
                 try:
+                    pot, field = self.compute_potential_pme(r_raw_now, q_now, box_now, self.compute_field)
                     pot_pme, field__pme = self.compute_potential_pme(r_raw_now, q_now, box_now, self.compute_field)
                     field = None
                     if self.compute_field:
